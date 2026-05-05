@@ -1,0 +1,89 @@
+import re
+from typing import Tuple
+
+import torch
+import torch.nn as nn
+
+from .dice import BinaryDiceLoss
+from .focal import BinaryFocalLossWithLogits
+from .lovasz import LovaszHingeLoss
+
+
+class AutoCriterion(nn.Module):
+    def __init__(self, name: str, data: dict = {}):
+        super().__init__()
+
+        self.rename = {"weighted_binary_cross_entropy": "wbce", "binary_cross_entropy": "bce"}
+        names, weights, instances = self.parse_criterion(name, data)
+        self.losses = nn.ModuleList(instances)
+        self.weights = weights
+        self.names = names
+
+    def __len__(self):
+        return len(self.losses)
+
+    def parse_criterion(self, criterion: str, data: dict) -> nn.Module:
+        entries = criterion.split("+")
+        names = []
+        weights = []
+        functions = []
+
+        for entry in entries:
+            weight, name = self.parse_entry(entry)
+            loss_fn = self.parse_instance(name, data)
+
+            if name in self.rename:
+                name = self.rename[name]
+            names.append(name)
+            functions.append(loss_fn)
+            weights.append(weight)
+        return names, weights, functions
+
+    def parse_entry(self, entry: str) -> Tuple[float, str]:
+        """
+        Parse a criterion entry with an optional weight.
+
+        Expected format:
+            "[weight]loss_name" or simply "loss_name"
+        Extra spaces around the weight and name are allowed.
+
+        Returns:
+            A tuple (weight, name) where weight is a float and name is the loss name string.
+        """
+        pattern = r"^\s*(?:\[(?P<weight>[\d\.]+)\])?\s*(?P<name>\S.*)$"
+        match = re.match(pattern, entry)
+        if not match:
+            raise ValueError(f"Could not parse criterion entry: {entry}")
+
+        weight_str = match.group("weight")
+        name = match.group("name").strip()
+        weight = float(weight_str) if weight_str is not None else 1.0
+        return weight, name
+
+    def parse_instance(self, name: str, data: dict = {}) -> nn.Module:
+        if name == "binary_cross_entropy" or name == "bce":
+            return nn.BCEWithLogitsLoss()
+        elif name == "focal_loss":
+            alpha = data.get('alpha', 0.75)
+            gamma = data.get('gamma', 2.0)
+            return BinaryFocalLossWithLogits(alpha, gamma)
+        elif name == "lovasz_hinge_loss" or name == "lovasz_loss" or name == "lovasz":
+            return LovaszHingeLoss()
+        elif name == "weighted_binary_cross_entropy" or name == "wbce":
+            nc = data.get("nc", 1)
+            pos_weight = torch.tensor(data["pos_weight"]).reshape(nc, 1, 1)
+            return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        elif name == "dice_loss" or name == "dice":
+            return BinaryDiceLoss()
+        else:
+            print(f"[WARN] Unknown criterion: {name}, using BCEWithLogitsLoss instead.")
+            return nn.BCEWithLogitsLoss()
+
+    def forward(self, preds, targets):
+        device = preds.device
+        self.to(device)
+        losses = torch.zeros(len(self.names), device=device)
+        aggr_loss = torch.zeros(1, device=device)
+        losses = torch.stack([w * fn(preds, targets) for w, fn in zip(self.weights, self.losses)])
+        aggr_loss = losses.sum()
+        return aggr_loss, losses
